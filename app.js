@@ -3,14 +3,17 @@
 let ort; // onnxruntime, ilk fotoğrafta yüklenir (yüklenemezse arayüz yine çalışır, hata yazılır)
 const ORT_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
 
-// Model: BiRefNet_lite (ONNX). Lisansı yayınlamadan önce model sayfasından doğrula.
-const MODEL_URL = 'https://huggingface.co/onnx-community/BiRefNet_lite/resolve/main/onnx/model.onnx';
-const MS = 1024;          // modelin giriş boyutu
+// Model: U²-Net (Apache-2.0), 320x320 giriş. WebGPU yerine WASM ile her cihazda çalışır.
+const MODEL_URL = 'https://huggingface.co/skillsafe-ai/u2net/resolve/main/u2net.onnx';
+const MS = 320;           // modelin giriş boyutu
 const TILE = 1024;        // rafine ve export parça boyutu
 const PAD = 32;           // parça taşma payı
 
 const $ = id => document.getElementById(id);
 const status = t => ($('status').textContent = t);
+let stage = '';
+const errText = e => typeof e === 'number' ? 'bellek hatası (kod ' + e + ')' : (e && (e.message || e.name)) || String(e);
+const OPT = { graphOptimizationLevel: 'basic', enableMemPattern: false, enableCpuMemArena: false };
 const progress = f => ($('bar').firstElementChild.style.width = Math.round(f * 100) + '%');
 
 let session, src, W, H, maskLow, alpha, lut, name = 'urun';
@@ -40,13 +43,13 @@ async function getModel() {
 
 async function ensureSession() {
   if (session) return;
-  status('Yapay zeka kütüphanesi yükleniyor…');
+  stage = 'kütüphane yükleme'; status('Yapay zeka kütüphanesi yükleniyor…');
   ort = await import(ORT_URL + 'ort.webgpu.min.mjs');
-  ort.env.wasm.wasmPaths = ORT_URL;
-  const bytes = await getModel();
-  status('Model hazırlanıyor…');
-  try { session = await ort.InferenceSession.create(bytes, { executionProviders: ['webgpu', 'wasm'] }); }
-  catch { session = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm'] }); }
+  ort.env.wasm.wasmPaths = ORT_URL; ort.env.wasm.numThreads = 1; ort.env.wasm.proxy = false;
+  stage = 'model indirme'; const bytes = await getModel();
+  stage = 'model hazırlama'; status('Model hazırlanıyor… (birkaç dakika sürebilir)');
+  try { session = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm'], ...OPT }); }
+  catch { session = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm'], ...OPT }); }
 }
 
 // ---------- maske (düşük çözünürlük) ----------
@@ -57,11 +60,11 @@ async function predictMask(bitmap) {
   const mean = [.485, .456, .406], std = [.229, .224, .225];
   for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) t[k * n + i] = (d[i * 4 + k] / 255 - mean[k]) / std[k];
   const out = await session.run({ [session.inputNames[0]]: new ort.Tensor('float32', t, [1, 3, MS, MS]) });
-  const data = out[session.outputNames[session.outputNames.length - 1]].data;
+  const data = out[session.outputNames[0]].data;
   let mn = Infinity, mx = -Infinity;
   for (let i = 0; i < n; i++) { if (data[i] < mn) mn = data[i]; if (data[i] > mx) mx = data[i]; }
   const m = new Float32Array(n), logits = mn < 0 || mx > 1;
-  for (let i = 0; i < n; i++) m[i] = logits ? 1 / (1 + Math.exp(-data[i])) : data[i];
+  for (let i = 0; i < n; i++) m[i] = logits ? 1 / (1 + Math.exp(-data[i])) : (data[i] - mn) / ((mx - mn) || 1);
   return m;
 }
 
@@ -146,12 +149,12 @@ function drawPreview() {
 }
 
 // ---------- ana akış ----------
-window.addEventListener('unhandledrejection', e => status('Hata: ' + (e.reason?.message || e.reason)));
-window.addEventListener('error', e => status('Hata: ' + e.message));
+window.addEventListener('unhandledrejection', e => status('Hata (' + stage + '): ' + errText(e.reason)));
+window.addEventListener('error', e => status('Hata (' + stage + '): ' + errText(e.error || e.message)));
 
 $('file').addEventListener('change', async e => {
   const f = e.target.files[0]; if (!f) return;
-  status('Fotoğraf okunuyor: ' + f.name);
+  stage = 'fotoğraf okuma'; status('Fotoğraf okunuyor: ' + f.name);
   name = f.name.replace(/\.[^.]+$/, '');
   for (const id of ['hard', 'choke', 'dl']) $(id).disabled = true;
   try {
@@ -160,15 +163,15 @@ $('file').addEventListener('change', async e => {
     src = document.createElement('canvas'); src.width = W; src.height = H;
     src.getContext('2d', { willReadFrequently: true }).drawImage(bmp, 0, 0);
     await ensureSession();
-    status('Ürün aranıyor…'); progress(0);
+    stage = 'maske hesaplama'; status('Ürün aranıyor…'); progress(0);
     maskLow = await predictMask(bmp);
-    await refine();
+    stage = 'kenar inceleme'; await refine();
     buildLut(); drawPreview();
     for (const id of ['hard', 'choke', 'dl']) $(id).disabled = false;
     progress(1); status(`Hazır: ${W}×${H} piksel. Kenar kaydırıcılarıyla ayarla, sonra indir.`);
   } catch (err) {
     console.error(err);
-    status('Hata: ' + err.message + (W * H > 1e8 ? ' (Fotoğraf bu tarayıcı için çok büyük olabilir.)' : ''));
+    status('Hata (' + stage + '): ' + errText(err) + (W * H > 1e8 ? ' (Fotoğraf bu tarayıcı için çok büyük olabilir.)' : ''));
   }
 });
 for (const id of ['hard', 'choke']) $(id).addEventListener('input', () => { if (alpha) { buildLut(); drawPreview(); } });
