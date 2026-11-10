@@ -11,8 +11,10 @@ Arka plan silme + tam çözünürlükte kenar rafine etme + şeffaf PNG çıktı
 Cloudflare Pages veya Netlify'a klasörü sürükle-bırak ile de yüklenebilir.
 Not: `index.html` çift tıklayıp açılmaz; HTTPS adres gerekir.
 
+## Dosyalar (hepsi aynı klasörde, ana dizinde olmalı)
+`index.html`, `app.js`, `matte.js`, `README.md`
+
 ## Notlar
-- İlk açılışta model (BiRefNet_lite, yüzlerce MB) indirilir, sonra tarayıcı önbelleğinden gelir.
-- WebGPU destekleyen masaüstü Chrome/Edge hızlıdır; olmayan cihazlarda yavaş (WASM) çalışır.
-- Model adresi `app.js` başındaki `MODEL_URL`. Ticari kullanım öncesi modelin lisansını Hugging Face sayfasından doğrula.
+- Yöntem: fotoğraftaki düz stüdyo zeminin rengini öğrenir, üründen farkı tam çözünürlükte alfa yapar. Model indirmez.
+- Düz/yumuşak degrade zemin için tasarlandı. Desenli veya karmaşık zeminde çalışmaz.
 - Çok büyük fotoğraflarda tarayıcının canvas limiti sınır olur; hata mesajı gösterilir.
