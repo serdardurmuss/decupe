@@ -1,7 +1,7 @@
 // Faz 1: arka plan silme + tam çözünürlükte kenar rafine etme + şeffaf PNG.
 // Her şey tarayıcıda çalışır; sunucu yok, ücret yok.
-import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.mjs';
-ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+let ort; // onnxruntime, ilk fotoğrafta yüklenir (yüklenemezse arayüz yine çalışır, hata yazılır)
+const ORT_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
 
 // Model: BiRefNet_lite (ONNX). Lisansı yayınlamadan önce model sayfasından doğrula.
 const MODEL_URL = 'https://huggingface.co/onnx-community/BiRefNet_lite/resolve/main/onnx/model.onnx';
@@ -40,6 +40,9 @@ async function getModel() {
 
 async function ensureSession() {
   if (session) return;
+  status('Yapay zeka kütüphanesi yükleniyor…');
+  ort = await import(ORT_URL + 'ort.webgpu.min.mjs');
+  ort.env.wasm.wasmPaths = ORT_URL;
   const bytes = await getModel();
   status('Model hazırlanıyor…');
   try { session = await ort.InferenceSession.create(bytes, { executionProviders: ['webgpu', 'wasm'] }); }
@@ -143,8 +146,12 @@ function drawPreview() {
 }
 
 // ---------- ana akış ----------
+window.addEventListener('unhandledrejection', e => status('Hata: ' + (e.reason?.message || e.reason)));
+window.addEventListener('error', e => status('Hata: ' + e.message));
+
 $('file').addEventListener('change', async e => {
   const f = e.target.files[0]; if (!f) return;
+  status('Fotoğraf okunuyor: ' + f.name);
   name = f.name.replace(/\.[^.]+$/, '');
   for (const id of ['hard', 'choke', 'dl']) $(id).disabled = true;
   try {
