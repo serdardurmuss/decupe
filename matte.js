@@ -89,10 +89,13 @@ export function makeLut(lo, hi) {
 }
 
 // Ürünün içinde kalan (kenara bağlı olmayan) boşlukları bul; zeminden farklıysa ürün say.
-export function holeMap(dq, W, H, lut, meanThr = 4.5) {
+export function holeMap(dq, W, H, lut, meanThr = 2.5, maxArea = Infinity) {
   const k = Math.max(1, Math.ceil(Math.max(W, H) / 1024)), lw = Math.ceil(W / k), lh = Math.ceil(H / k), n = lw * lh;
   const low = new Uint8Array(n);
   for (let y = 0; y < lh; y++) for (let x = 0; x < lw; x++) low[y * lw + x] = lut[dq[Math.min(H - 1, y * k) * W + Math.min(W - 1, x * k)]] < 128 ? 1 : 0;
+  const orig = low.slice(), dil = new Uint8Array(n);        // parçalanmış bölgeleri birleştirmek için 1 piksel şişir
+  for (let y = 0; y < lh; y++) for (let x = 0; x < lw; x++) if (orig[y * lw + x]) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const yy = y + dy, xx = x + dx; if (yy >= 0 && yy < lh && xx >= 0 && xx < lw) dil[yy * lw + xx] = 1; }
+  low.set(dil);
   const lab = new Int32Array(n), fill = new Uint8Array(n), q = new Int32Array(n);
   let id = 0;
   for (let s = 0; s < n; s++) {
@@ -108,7 +111,10 @@ export function holeMap(dq, W, H, lut, meanThr = 4.5) {
       if (y > 0 && low[p - lw] && !lab[p - lw]) { lab[p - lw] = id; q[tail++] = p - lw; }
       if (y < lh - 1 && low[p + lw] && !lab[p + lw]) { lab[p + lw] = id; q[tail++] = p + lw; }
     }
-    if (!border && sum / members.length > meanThr) for (const p of members) fill[p] = 1;
+    if (!border) {   // 1 = ürünün parçası (yansıma/boşluk gibi görünen), 2 = gerçek delik (zeminin renkli yansıması)
+      if (members.length * k * k > maxArea) { for (const p of members) if (orig[p]) fill[p] = 2; }
+      else if (sum / members.length > meanThr) { for (const p of members) if (orig[p]) fill[p] = 1; }
+    }
   }
   return { fill, k, lw };
 }
