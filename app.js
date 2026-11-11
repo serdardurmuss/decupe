@@ -1,123 +1,185 @@
-// Faz 1 (v4): düz stüdyo zemininde, fotoğrafın kendi zemin rengini öğrenerek tam çözünürlükte arka plan silme.
-// Yapay zeka modeli yok, indirme yok; ince zincir detayları kaybolmaz. Her şey tarayıcıda çalışır.
-import { fitBackground, diffTile, makeLut, holeMap, evalBg, lab2rgb } from './matte.js?v=4';
+// Faz 2: leke silme (inpaint/doku kopyalama) ve kopyalama aracı. Tam çözünürlükte, alfa korunarak.
+import { inpaint, addGrain, patchFill } from './heal.js?v=1';
 
-const TILE = 1024, PAD = 2;
 const $ = id => document.getElementById(id);
 const status = t => ($('status').textContent = t);
-const progress = f => ($('bar').firstElementChild.style.width = Math.round(f * 100) + '%');
-const tick = () => new Promise(r => setTimeout(r));
+const view = $('view'), cv = $('cv'), ov = $('ov'), cur = $('cursor'), og = ov.getContext('2d');
+let ctx, W = 0, H = 0, s = 1, tx = 0, ty = 0, name = 'urun';
+let tool = 'heal', cloneSrc = null, cloneOff = null, drawing = false, pts = [], panning = false, space = false, last = null;
+let tiles = null; const undo = [], TS = 256;
+const R = () => +$('size').value;
 
-let src, W, H, coef, dq, lut, holes, name = 'urun';
-const ctrl = ['lo', 'soft', 'fill', 'dl'];
+// ---------- görünüm ----------
+function applyView() {
+  cv.style.transform = `translate(${tx}px,${ty}px) scale(${s})`;
+  cv.style.imageRendering = s >= 3 ? 'pixelated' : 'auto';
+  ov.width = view.clientWidth; ov.height = view.clientHeight; drawOverlay();
+}
+function fit() {
+  const r = view.getBoundingClientRect();
+  s = Math.min(1, (r.width - 8) / W, (r.height - 8) / H);
+  tx = (r.width - W * s) / 2; ty = (r.height - H * s) / 2; applyView();
+}
+const toImg = e => { const r = view.getBoundingClientRect(); return [(e.clientX - r.left - tx) / s, (e.clientY - r.top - ty) / s]; };
+const toScr = p => [p[0] * s + tx, p[1] * s + ty];
 
-// ---------- analiz ----------
-async function analyze(file) {
-  const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
-  W = bmp.width; H = bmp.height;
-  src = document.createElement('canvas'); src.width = W; src.height = H;
-  const sg = src.getContext('2d', { willReadFrequently: true });
-  sg.drawImage(bmp, 0, 0);
-
-  status('Zemin rengi öğreniliyor…');
-  const k = Math.min(1, 320 / Math.max(W, H)), sw = Math.max(16, Math.round(W * k)), sh = Math.max(16, Math.round(H * k));
-  const sc = document.createElement('canvas'); sc.width = sw; sc.height = sh;
-  const cg = sc.getContext('2d', { willReadFrequently: true });
-  cg.imageSmoothingQuality = 'high'; cg.drawImage(src, 0, 0, sw, sh);
-  coef = fitBackground(cg.getImageData(0, 0, sw, sh).data, sw, sh);
-
-  dq = new Uint8Array(W * H);
-  const nx = Math.ceil(W / TILE), ny = Math.ceil(H / TILE);
-  for (let ty = 0; ty < ny; ty++) for (let tx = 0; tx < nx; tx++) {
-    const x0 = tx * TILE, y0 = ty * TILE, x1 = Math.min(W, x0 + TILE), y1 = Math.min(H, y0 + TILE);
-    const px0 = Math.max(0, x0 - PAD), py0 = Math.max(0, y0 - PAD), px1 = Math.min(W, x1 + PAD), py1 = Math.min(H, y1 + PAD);
-    const w = px1 - px0, h = py1 - py0, im = sg.getImageData(px0, py0, w, h);
-    diffTile(im.data, w, h, px0, py0, W, H, coef, x0 - px0, y0 - py0, x1 - x0, y1 - y0, dq);
-    progress((ty * nx + tx + 1) / (nx * ny));
-    status(`Ürün tam çözünürlükte ayrılıyor: parça ${ty * nx + tx + 1}/${nx * ny}`);
-    await tick();
+function drawOverlay() {
+  og.clearRect(0, 0, ov.width, ov.height);
+  if (drawing && tool === 'heal' && pts.length) {
+    og.strokeStyle = 'rgba(255,50,50,.55)'; og.fillStyle = 'rgba(255,50,50,.55)';
+    og.lineWidth = R() * s; og.lineCap = og.lineJoin = 'round'; og.beginPath();
+    pts.forEach((p, i) => { const q = toScr(p); i ? og.lineTo(q[0], q[1]) : og.moveTo(q[0], q[1]); });
+    og.stroke();
+    if (pts.length === 1) { const q = toScr(pts[0]); og.beginPath(); og.arc(q[0], q[1], R() * s / 2, 0, 7); og.fill(); }
+  }
+  if (tool === 'clone' && cloneSrc) {
+    const p = drawing && cloneOff ? [pts[pts.length - 1][0] + cloneOff[0], pts[pts.length - 1][1] + cloneOff[1]] : cloneSrc, q = toScr(p);
+    og.strokeStyle = '#3df'; og.lineWidth = 2; og.beginPath();
+    og.moveTo(q[0] - 10, q[1]); og.lineTo(q[0] + 10, q[1]); og.moveTo(q[0], q[1] - 10); og.lineTo(q[0], q[1] + 10); og.stroke();
   }
 }
 
-// ---------- alfa ----------
-function refresh() {
-  const lo = +$('lo').value, soft = +$('soft').value;
-  lut = makeLut(lo, lo + soft);
-  holes = $('fill').checked ? holeMap(dq, W, H, lut) : null;
-  drawPreview();
+// ---------- geri alma (değişen 256px parçalar saklanır) ----------
+function saveRegion(x0, y0, x1, y1) {
+  x0 = Math.max(0, x0); y0 = Math.max(0, y0); x1 = Math.min(W, x1); y1 = Math.min(H, y1);
+  for (let ty_ = Math.floor(y0 / TS); ty_ <= Math.floor((y1 - 1) / TS); ty_++) for (let tx_ = Math.floor(x0 / TS); tx_ <= Math.floor((x1 - 1) / TS); tx_++) {
+    const k = tx_ + ',' + ty_; if (tiles.has(k)) continue;
+    const x = tx_ * TS, y = ty_ * TS; tiles.set(k, { x, y, d: ctx.getImageData(x, y, Math.min(TS, W - x), Math.min(TS, H - y)) });
+  }
 }
-function alphaAt(x, y) {
-  const a = lut[dq[y * W + x]];
-  if (a < 128 && holes && holes.fill[((y / holes.k) | 0) * holes.lw + ((x / holes.k) | 0)]) return 255;
-  return a;
-}
-// im: kaynak renkleri taşıyan ImageData; mx/my: çıktı pikselinin tam çözünürlükteki karşılığı.
-// Yarı saydam kenar piksellerinden eski zemin rengini çıkarır (halo olmaz).
-function render(im, w, h, mx, my) {
-  const d = im.data, phi = new Float64Array(10), bl = new Float64Array(3);
+function commit() { if (tiles && tiles.size) { undo.push(tiles); if (undo.length > 25) undo.shift(); } tiles = null; $('undo').disabled = !undo.length; }
+function doUndo() { const t = undo.pop(); if (!t) return; for (const v of t.values()) ctx.putImageData(v.d, v.x, v.y); $('undo').disabled = !undo.length; }
+
+// ---------- kopyalama ----------
+function dab(p) {
+  const r = R() / 2, cx = Math.round(p[0]), cy = Math.round(p[1]);
+  const x0 = Math.max(0, Math.floor(cx - r)), y0 = Math.max(0, Math.floor(cy - r)), x1 = Math.min(W, Math.ceil(cx + r) + 1), y1 = Math.min(H, Math.ceil(cy + r) + 1);
+  const w = x1 - x0, h = y1 - y0; if (w <= 0 || h <= 0) return;
+  saveRegion(x0, y0, x1, y1);
+  const dst = ctx.getImageData(x0, y0, w, h), sr = ctx.getImageData(x0 + Math.round(cloneOff[0]), y0 + Math.round(cloneOff[1]), w, h), D = dst.data, S = sr.data;
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    const fx = mx(x), fy = my(y), a = alphaAt(fx, fy) / 255, i = (y * w + x) * 4;
-    if (a <= 0.004) { d[i + 3] = 0; continue; }
-    if (a < 0.996) {
-      evalBg(coef, fx, fy, W, H, phi, bl);
-      const B = lab2rgb(bl[0], bl[1], bl[2]);
-      for (let c = 0; c < 3; c++) d[i + c] = Math.min(255, Math.max(0, (d[i + c] - (1 - a) * B[c] * 255) / a));
-    }
-    d[i + 3] = a * 255;
+    const d = Math.hypot(x0 + x - cx, y0 + y - cy); if (d > r) continue;
+    let k = d < r * .5 ? 1 : 1 - (d - r * .5) / (r * .5); k = k * k * (3 - 2 * k) * .95;
+    const i = (y * w + x) * 4; if (D[i + 3] === 0 || S[i + 3] < 200) continue;
+    for (let c = 0; c < 3; c++) D[i + c] = D[i + c] * (1 - k) + S[i + c] * k;
   }
+  ctx.putImageData(dst, x0, y0);
+}
+function dabLine(a, b) {
+  const step = Math.max(1, R() / 6), n = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / step));
+  for (let i = 1; i <= n; i++) dab([a[0] + (b[0] - a[0]) * i / n, a[1] + (b[1] - a[1]) * i / n]);
 }
 
-function drawPreview() {
-  const k = Math.min(1, 1200 / Math.max(W, H)), pw = Math.round(W * k), ph = Math.round(H * k);
-  for (const id of ['orig', 'res']) { $(id).width = pw; $(id).height = ph; }
-  const og = $('orig').getContext('2d'); og.imageSmoothingQuality = 'high'; og.drawImage(src, 0, 0, pw, ph);
-  const g = $('res').getContext('2d', { willReadFrequently: true });
-  g.imageSmoothingQuality = 'high'; g.drawImage(src, 0, 0, pw, ph);
-  const im = g.getImageData(0, 0, pw, ph);
-  render(im, pw, ph, x => Math.min(W - 1, ((x + .5) / pw * W) | 0), y => Math.min(H - 1, ((y + .5) / ph * H) | 0));
-  g.putImageData(im, 0, 0);
+// ---------- leke silme ----------
+function applyHeal(path) {
+  const rad = R() / 2 + 1; let bx0 = 1e9, by0 = 1e9, bx1 = -1e9, by1 = -1e9;
+  for (const [x, y] of path) { bx0 = Math.min(bx0, x); by0 = Math.min(by0, y); bx1 = Math.max(bx1, x); by1 = Math.max(by1, y); }
+  const x0 = Math.floor(bx0 - rad), y0 = Math.floor(by0 - rad), x1 = Math.ceil(bx1 + rad), y1 = Math.ceil(by1 + rad);
+  const P = Math.max(40, Math.round(Math.max(x1 - x0, y1 - y0) * .8) + 24);
+  const wx0 = Math.max(0, x0 - P), wy0 = Math.max(0, y0 - P), wx1 = Math.min(W, x1 + P), wy1 = Math.min(H, y1 + P), w = wx1 - wx0, h = wy1 - wy0;
+  if (w < 8 || h < 8) return;
+  const mc = new OffscreenCanvas(w, h), mg = mc.getContext('2d');
+  mg.strokeStyle = mg.fillStyle = '#fff'; mg.lineWidth = R() + 2; mg.lineCap = mg.lineJoin = 'round'; mg.beginPath();
+  path.forEach(([x, y], i) => i ? mg.lineTo(x - wx0, y - wy0) : mg.moveTo(x - wx0, y - wy0)); mg.stroke();
+  mg.beginPath(); mg.arc(path[0][0] - wx0, path[0][1] - wy0, rad, 0, 7); mg.fill();
+  const m = mg.getImageData(0, 0, w, h).data, im = ctx.getImageData(wx0, wy0, w, h), d = im.data, n = w * h;
+  const rgb = new Float32Array(n * 3), known = new Float32Array(n), hole = new Float32Array(n); let holes = 0;
+  for (let i = 0; i < n; i++) {
+    rgb[i * 3] = d[i * 4]; rgb[i * 3 + 1] = d[i * 4 + 1]; rgb[i * 3 + 2] = d[i * 4 + 2];
+    if (m[i * 4 + 3] > 127 && d[i * 4 + 3] > 0) { hole[i] = 1; holes++; } else known[i] = d[i * 4 + 3] / 255;
+  }
+  if (!holes) return;
+  const mode = $('mode').value; let filled = null, used = '';
+  if (mode !== 'smooth' && n <= 160000) {
+    const p = patchFill(rgb, known, w, h, n > 60000 ? 3 : 2);
+    if (p && (mode === 'texture' || p.texture > 8)) { filled = p.filled; used = 'doku kopyalama'; }
+  }
+  if (!filled) {
+    filled = inpaint(rgb, known, w, h);
+    if (!filled) { status('Çevrede kullanılabilir ürün yüzeyi bulunamadı, fırçayı küçült veya yerini değiştir.'); return; }
+    addGrain(filled, rgb, known, w, h, +$('grain').value / 100, (wx0 * 7919 + wy0) | 1); used = 'yumuşak doldurma';
+  }
+  let soft = hole;                                             // kenarı 2px yumuşat
+  for (let it = 0; it < 2; it++) {
+    const t = new Float32Array(n);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let a = 0, c = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const yy = y + dy, xx = x + dx; if (yy >= 0 && yy < h && xx >= 0 && xx < w) { a += soft[yy * w + xx]; c++; } }
+      t[y * w + x] = a / c;
+    }
+    soft = t;
+  }
+  saveRegion(wx0, wy0, wx1, wy1);
+  for (let i = 0; i < n; i++) {
+    const k = hole[i] ? 1 : Math.min(1, soft[i] * 1.6); if (k <= 0 || d[i * 4 + 3] === 0) continue;
+    for (let c = 0; c < 3; c++) d[i * 4 + c] = Math.min(255, Math.max(0, rgb[i * 3 + c] * (1 - k) + filled[i * 3 + c] * k));
+  }
+  ctx.putImageData(im, wx0, wy0); status('Leke silindi (' + used + ').');
 }
 
-function setStageBg() {
-  const v = $('bgsel').value;
-  for (const s of document.querySelectorAll('.stage'))
-    s.style.background = v === 'white' ? '#fff' : v === 'dark' ? '#15171b' : '';
-}
+// ---------- fare / dokunma ----------
+view.addEventListener('contextmenu', e => e.preventDefault());
+view.addEventListener('pointerdown', e => {
+  if (!W) return; view.setPointerCapture(e.pointerId);
+  if (e.button === 1 || e.button === 2 || space) { panning = true; last = [e.clientX, e.clientY]; return; }
+  if (e.button !== 0) return;
+  const p = toImg(e);
+  if (tool === 'clone' && e.altKey) { cloneSrc = p; cloneOff = null; drawOverlay(); status('Kaynak seçildi. Şimdi kopyalamak istediğin yeri boya.'); return; }
+  if (tool === 'clone' && !cloneSrc) { status('Önce Option (Alt) tuşuna basılı tutarak kopyalanacak yeri tıkla.'); return; }
+  drawing = true; pts = [p]; tiles = new Map();
+  if (tool === 'clone') { if (!cloneOff) cloneOff = [cloneSrc[0] - p[0], cloneSrc[1] - p[1]]; dab(p); }
+  drawOverlay();
+});
+view.addEventListener('pointermove', e => {
+  const r = view.getBoundingClientRect(); cur.style.display = 'block';
+  cur.style.left = e.clientX - r.left + 'px'; cur.style.top = e.clientY - r.top + 'px'; cur.style.width = cur.style.height = Math.max(4, R() * s) + 'px';
+  if (panning) { tx += e.clientX - last[0]; ty += e.clientY - last[1]; last = [e.clientX, e.clientY]; applyView(); return; }
+  if (!drawing) return;
+  const p = toImg(e), a = pts[pts.length - 1];
+  if (tool === 'clone') dabLine(a, p);
+  pts.push(p); drawOverlay();
+});
+const up = () => {
+  if (panning) { panning = false; return; }
+  if (!drawing) return; drawing = false;
+  if (tool === 'heal') applyHeal(pts);
+  commit(); pts = []; drawOverlay();
+};
+view.addEventListener('pointerup', up); view.addEventListener('pointercancel', up);
+view.addEventListener('pointerleave', () => (cur.style.display = 'none'));
+view.addEventListener('wheel', e => {
+  if (!W) return; e.preventDefault();
+  const r = view.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top, ns = Math.min(24, Math.max(.05, s * Math.exp(-e.deltaY * .0015)));
+  tx = mx - (mx - tx) * ns / s; ty = my - (my - ty) * ns / s; s = ns; applyView();
+}, { passive: false });
+addEventListener('keydown', e => {
+  if (e.code === 'Space' && !/INPUT|SELECT/.test(document.activeElement.tagName)) { space = true; e.preventDefault(); }
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); doUndo(); }
+});
+addEventListener('keyup', e => { if (e.code === 'Space') space = false; });
+addEventListener('resize', () => W && applyView());
 
-// ---------- olaylar ----------
+// ---------- kontroller ----------
+for (const r of document.querySelectorAll('input[name=tool]')) r.addEventListener('change', () => {
+  tool = r.value; $('healOpts').style.display = tool === 'heal' ? '' : 'none'; drawOverlay();
+});
+$('size').addEventListener('input', () => ($('sizeV').textContent = R()));
+$('bgsel').addEventListener('change', () => { const v = $('bgsel').value; view.style.background = v === 'white' ? '#fff' : v === 'dark' ? '#15171b' : ''; });
+$('undo').addEventListener('click', doUndo);
+$('fit').addEventListener('click', fit);
 $('file').addEventListener('change', async e => {
   const f = e.target.files[0]; if (!f) return;
-  name = f.name.replace(/\.[^.]+$/, '');
-  for (const id of ctrl) $(id).disabled = true;
   try {
-    status('Fotoğraf okunuyor: ' + f.name); progress(0);
-    await analyze(f);
-    refresh();
-    for (const id of ctrl) $(id).disabled = false;
-    progress(1); status(`Hazır: ${W}×${H} piksel. Sonucu beyaz ve koyu zeminde de kontrol et, sonra indir.`);
-  } catch (err) {
-    console.error(err);
-    status('Hata: ' + (err?.message || err) + (W * H > 1e8 ? ' (Fotoğraf bu tarayıcı için çok büyük olabilir.)' : ''));
-  }
-});
-for (const id of ['lo', 'soft', 'fill']) $(id).addEventListener('input', () => dq && refresh());
-$('bgsel').addEventListener('change', setStageBg);
-
-$('dl').addEventListener('click', async () => {
-  $('dl').disabled = true; status('PNG hazırlanıyor (tam çözünürlük)…');
-  try {
-    const out = document.createElement('canvas'); out.width = W; out.height = H;
-    const sg = src.getContext('2d', { willReadFrequently: true }), og = out.getContext('2d');
-    for (let y0 = 0; y0 < H; y0 += TILE) for (let x0 = 0; x0 < W; x0 += TILE) {
-      const w = Math.min(TILE, W - x0), h = Math.min(TILE, H - y0), im = sg.getImageData(x0, y0, w, h);
-      render(im, w, h, x => x0 + x, y => y0 + y);
-      og.putImageData(im, x0, y0);
-      await tick();
-    }
-    const blob = await new Promise(res => out.toBlob(res, 'image/png'));
-    if (!blob) throw new Error('Tarayıcı bu boyutta PNG üretemedi.');
-    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name + '_seffaf.png'; a.click();
-    status('İndirildi.');
+    name = f.name.replace(/\.[^.]+$/, ''); status('Fotoğraf okunuyor…');
+    const bmp = await createImageBitmap(f, { imageOrientation: 'from-image' });
+    W = bmp.width; H = bmp.height; cv.width = W; cv.height = H;
+    ctx = cv.getContext('2d', { willReadFrequently: true }); ctx.drawImage(bmp, 0, 0);
+    undo.length = 0; cloneSrc = cloneOff = null; fit();
+    for (const id of ['undo', 'fit', 'dl']) $(id).disabled = id === 'undo';
+    status(`${W}×${H} piksel yüklendi. Lekenin üzerini boya.`);
   } catch (err) { status('Hata: ' + (err?.message || err)); }
-  $('dl').disabled = false;
 });
+$('dl').addEventListener('click', () => cv.toBlob(b => {
+  if (!b) return status('Tarayıcı bu boyutta PNG üretemedi.');
+  const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = name + '_temiz.png'; a.click(); status('İndirildi.');
+}, 'image/png'));
